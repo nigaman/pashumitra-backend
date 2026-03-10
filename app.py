@@ -15,36 +15,51 @@ from chatbot import chatbot_bp
 
 app = Flask(__name__)
 
-# ---- CORS: allow ALL origins (fixes frontend fetch errors) ----
-CORS(app, resources={r"/*": {"origins": "*"}})
+# ---- CORS FIXED ----
+CORS(app, resources={r"/*": {"origins": "*"}}, 
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "OPTIONS"])
 
-# ---- MODEL ----
+# ---- LOAD MODEL AT STARTUP ----
+print("🔄 Loading YOLO model...")
 MODEL_PATH = os.path.join(os.getcwd(), "models", "best.pt")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
 model = YOLO(MODEL_PATH)
+print("✅ YOLO model loaded!")
 
 # ---- MONGODB ATLAS ----
+print("🔄 Connecting to MongoDB...")
 MONGO_URI = os.environ.get(
     "MONGO_URI",
     "mongodb+srv://pashumitra_user:Cattle2024@cluster0.p4bec5t.mongodb.net/cattle_ai?retryWrites=true&w=majority&appName=Cluster0"
 )
-client = MongoClient(MONGO_URI)
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = client["cattle_ai"]
 breeds_col = db["breeds"]
+print("✅ MongoDB connected!")
 
 # ---- CHATBOT ----
 app.register_blueprint(chatbot_bp, url_prefix='/api')
 
-# ---- HEALTH CHECK (keeps Render awake) ----
+# ---- AFTER REQUEST: ADD CORS HEADERS TO EVERY RESPONSE ----
+@app.after_request
+def after_request(response):
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    return response
+
+# ---- HOME / HEALTH ----
 @app.route("/")
 def home():
     return jsonify({
-        "status": "PashuMitra Backend Running Successfully",
+        "status": "ok",
+        "message": "PashuMitra Backend Running!",
         "endpoints": {
             "predict": "/predict",
             "breeds": "/breeds",
-            "breed_detail": "/breed/<breed_name>",
+            "breed_detail": "/breed/<name>",
             "chat": "/api/chat",
             "suggestions": "/api/chat/suggestions"
         }
@@ -54,34 +69,39 @@ def home():
 def health():
     return jsonify({"status": "ok"}), 200
 
-# ---- PREDICTION ----
+# ---- PREDICT ----
 @app.route("/predict", methods=["POST", "OPTIONS"])
 def predict():
-    # Handle preflight CORS request
+    # Handle CORS preflight
     if request.method == "OPTIONS":
-        response = jsonify({"status": "ok"})
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add("Access-Control-Allow-Headers", "*")
-        response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
-        return response, 200
+        return jsonify({"status": "ok"}), 200
 
     try:
         files = request.files.getlist("images")
+
         if not files or len(files) == 0:
-            return jsonify({"error": "No images received"}), 400
+            return jsonify({
+                "valid_cattle": False,
+                "message": "No images received."
+            }), 400
 
         images = []
         for f in files[:5]:
             try:
-                img = Image.open(io.BytesIO(f.read())).convert("RGB")
+                img_bytes = f.read()
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 images.append(img)
             except Exception as img_err:
-                print(f"Error reading image: {img_err}")
+                print(f"⚠️ Skipping bad image: {img_err}")
                 continue
 
         if not images:
-            return jsonify({"error": "Could not process any images"}), 400
+            return jsonify({
+                "valid_cattle": False,
+                "message": "Could not process images. Please upload valid cattle photos."
+            }), 400
 
+        # Run YOLO prediction
         results = model(images)
 
         predictions = []
@@ -114,6 +134,7 @@ def predict():
         final_confidence = round(avg_conf * agreement * 100, 2)
         trust = "HIGH" if agreement >= 0.8 else "MEDIUM" if agreement >= 0.5 else "LOW"
 
+        # Fetch breed info from MongoDB
         breed_info = breeds_col.find_one({"name": final_breed}, {"_id": 0})
 
         return jsonify({
@@ -126,26 +147,32 @@ def predict():
         })
 
     except Exception as e:
-        print(f"Prediction error: {e}")
+        print(f"❌ Predict error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-# ---- BREED ROUTES ----
+# ---- BREEDS ----
 @app.route("/breeds", methods=["GET"])
 def get_all_breeds():
-    breeds = list(breeds_col.find({}, {"_id": 0, "name": 1, "origin": 1, "purpose": 1}))
-    return jsonify({"total": len(breeds), "breeds": breeds})
+    try:
+        breeds = list(breeds_col.find({}, {"_id": 0, "name": 1, "origin": 1, "purpose": 1}))
+        return jsonify({"total": len(breeds), "breeds": breeds})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/breed/<breed_name>", methods=["GET"])
 def get_breed_details(breed_name):
-    breed = breeds_col.find_one({"name": breed_name}, {"_id": 0})
-    if breed:
-        return jsonify(breed)
-    return jsonify({"error": f"Breed '{breed_name}' not found"}), 404
+    try:
+        breed = breeds_col.find_one({"name": breed_name}, {"_id": 0})
+        if breed:
+            return jsonify(breed)
+        return jsonify({"error": f"Breed '{breed_name}' not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---- START ----
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 PashuMitra Backend Starting on port {port}...")
+    print(f"🚀 PashuMitra starting on port {port}...")
     app.run(host="0.0.0.0", port=port)
