@@ -14,29 +14,29 @@ from pymongo import MongoClient
 from chatbot import chatbot_bp
 
 app = Flask(__name__)
-CORS(app)
 
-# ---------------- LOAD MODEL SAFELY ----------------
+# ---- CORS: allow ALL origins (fixes frontend fetch errors) ----
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+# ---- MODEL ----
 MODEL_PATH = os.path.join(os.getcwd(), "models", "best.pt")
-
 if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
-
+    raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
 model = YOLO(MODEL_PATH)
 
-# ---------------- MONGODB ATLAS CONNECT ----------------
+# ---- MONGODB ATLAS ----
 MONGO_URI = os.environ.get(
     "MONGO_URI",
     "mongodb+srv://pashumitra_user:Cattle2024@cluster0.p4bec5t.mongodb.net/cattle_ai?retryWrites=true&w=majority&appName=Cluster0"
 )
-
 client = MongoClient(MONGO_URI)
 db = client["cattle_ai"]
 breeds_col = db["breeds"]
 
-# ---------------- REGISTER CHATBOT ----------------
+# ---- CHATBOT ----
 app.register_blueprint(chatbot_bp, url_prefix='/api')
 
+# ---- HEALTH CHECK (keeps Render awake) ----
 @app.route("/")
 def home():
     return jsonify({
@@ -50,18 +50,37 @@ def home():
         }
     })
 
-# ---------------- PREDICTION ROUTE ----------------
-@app.route("/predict", methods=["POST"])
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
+# ---- PREDICTION ----
+@app.route("/predict", methods=["POST", "OPTIONS"])
 def predict():
+    # Handle preflight CORS request
+    if request.method == "OPTIONS":
+        response = jsonify({"status": "ok"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "*")
+        response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
+        return response, 200
+
     try:
         files = request.files.getlist("images")
-        if not files:
+        if not files or len(files) == 0:
             return jsonify({"error": "No images received"}), 400
 
         images = []
         for f in files[:5]:
-            img = Image.open(io.BytesIO(f.read())).convert("RGB")
-            images.append(img)
+            try:
+                img = Image.open(io.BytesIO(f.read())).convert("RGB")
+                images.append(img)
+            except Exception as img_err:
+                print(f"Error reading image: {img_err}")
+                continue
+
+        if not images:
+            return jsonify({"error": "Could not process any images"}), 400
 
         results = model(images)
 
@@ -107,10 +126,11 @@ def predict():
         })
 
     except Exception as e:
+        print(f"Prediction error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-# ---------------- BREED ROUTES ----------------
+# ---- BREED ROUTES ----
 @app.route("/breeds", methods=["GET"])
 def get_all_breeds():
     breeds = list(breeds_col.find({}, {"_id": 0, "name": 1, "origin": 1, "purpose": 1}))
@@ -121,11 +141,10 @@ def get_breed_details(breed_name):
     breed = breeds_col.find_one({"name": breed_name}, {"_id": 0})
     if breed:
         return jsonify(breed)
-    else:
-        return jsonify({"error": f"Breed '{breed_name}' not found"}), 404
+    return jsonify({"error": f"Breed '{breed_name}' not found"}), 404
 
 
-# ---------------- START ----------------
+# ---- START ----
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 PashuMitra Backend Starting on port {port}...")
