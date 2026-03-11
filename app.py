@@ -1,10 +1,11 @@
-import os
-import gc
-import time
+import os, gc, time, io, traceback
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["OPENBLAS_NUM_THREADS"] = "4"
 os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["TORCH_NUM_THREADS"] = "4"
 
 import torch
 torch.set_num_threads(4)
@@ -12,9 +13,7 @@ torch.set_num_threads(4)
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ultralytics import YOLO
-from PIL import Image, ImageEnhance, ImageFilter
-import io
-from collections import Counter
+from PIL import Image, ImageEnhance
 from pymongo import MongoClient
 from chatbot import chatbot_bp
 
@@ -22,43 +21,65 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ============================================================
-# LOAD MODEL
+# LOAD MODEL — try ONNX first (3x faster CPU), fallback to .pt
 # ============================================================
-print("🔄 Loading YOLO model...")
-MODEL_PATH = os.path.join(os.getcwd(), "models", "best.pt")
-model = YOLO(MODEL_PATH)
+print("🔄 Loading model...")
+MODEL_DIR = os.path.join(os.getcwd(), "models")
+ONNX_PATH = os.path.join(MODEL_DIR, "best.onnx")
+PT_PATH   = os.path.join(MODEL_DIR, "best.pt")
 
-print("🔥 Warming up model...")
-dummy = Image.new("RGB", (640, 640), color=(120, 100, 80))
+if os.path.exists(ONNX_PATH):
+    print("⚡ Using ONNX model (faster CPU inference)")
+    model = YOLO(ONNX_PATH, task="classify")
+else:
+    print("📦 Using PyTorch model (.pt)")
+    model = YOLO(PT_PATH)
+    # Export to ONNX for next startup
+    try:
+        print("🔄 Exporting to ONNX for future speed...")
+        model.export(format="onnx", imgsz=640, simplify=True, opset=12)
+        import shutil
+        exported = PT_PATH.replace(".pt", ".onnx")
+        if os.path.exists(exported):
+            shutil.move(exported, ONNX_PATH)
+            print("✅ ONNX exported! Next restart will be faster.")
+    except Exception as e:
+        print(f"⚠️ ONNX export failed (will use .pt): {e}")
+
+# Warmup — run 3 dummy inferences to heat up CPU cache
+print("🔥 Warming up...")
+dummy = Image.new("RGB", (640, 640), color=(110, 90, 70))
 with torch.no_grad():
     for _ in range(3):
         model.predict(dummy, imgsz=640, verbose=False)
-print(f"✅ YOLO ready! Classes: {len(model.names)}")
-print(f"📋 Sample classes: {list(model.names.values())[:5]}")
+print(f"✅ Model ready! {len(model.names)} classes")
 
 # ============================================================
-# MONGODB — CACHE ALL BREEDS IN MEMORY
+# MONGODB — FULL CACHE IN RAM
 # ============================================================
 print("🔄 Connecting to MongoDB Atlas...")
 MONGO_URI = os.environ.get(
     "MONGO_URI",
     "mongodb+srv://pashumitra_user:Cattle2024@cluster0.p4bec5t.mongodb.net/cattle_ai?retryWrites=true&w=majority&appName=Cluster0"
 )
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+client = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=8000,
+    connectTimeoutMS=8000,
+    socketTimeoutMS=8000
+)
 db = client["cattle_ai"]
-breeds_col = db["breeds"]
-
 breed_cache = {}
-for doc in breeds_col.find({}, {"_id": 0}):
+for doc in db["breeds"].find({}, {"_id": 0}):
     name = doc.get("name", "")
     if name:
         breed_cache[name] = doc
 
-print(f"✅ MongoDB connected! {len(breed_cache)} breeds cached.")
+print(f"✅ {len(breed_cache)} breeds cached from MongoDB")
 
-# ============================================================
-# CHATBOT
-# ============================================================
+# Thread pool for parallel image loading
+executor = ThreadPoolExecutor(max_workers=5)
+
 app.register_blueprint(chatbot_bp, url_prefix='/api')
 
 # ============================================================
@@ -67,7 +88,7 @@ app.register_blueprint(chatbot_bp, url_prefix='/api')
 @app.after_request
 def after_request(response):
     response.headers.add("Access-Control-Allow-Origin", "*")
-    response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type")
     response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     return response
 
@@ -79,20 +100,26 @@ def after_request(response):
 def health():
     return jsonify({
         "status": "ok",
-        "message": "PashuMitra Running!",
         "breeds_loaded": len(breed_cache),
         "model_classes": len(model.names)
     })
 
 # ============================================================
-# IMAGE ENHANCEMENT
+# IMAGE LOAD (runs in thread pool)
 # ============================================================
-def enhance_image(img):
-    img = img.resize((640, 640), Image.LANCZOS)
-    img = ImageEnhance.Contrast(img).enhance(1.1)
-    img = ImageEnhance.Sharpness(img).enhance(1.15)
-    img = ImageEnhance.Brightness(img).enhance(1.05)
-    return img
+def load_image(file_storage):
+    try:
+        raw = file_storage.read()
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        # Already compressed to 640x640 by frontend — just enhance
+        if img.size != (640, 640):
+            img = img.resize((640, 640), Image.LANCZOS)
+        img = ImageEnhance.Contrast(img).enhance(1.08)
+        img = ImageEnhance.Sharpness(img).enhance(1.12)
+        return img
+    except Exception as e:
+        print(f"⚠️ Bad image: {e}")
+        return None
 
 # ============================================================
 # PREDICT
@@ -102,115 +129,76 @@ def predict():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
 
-    t_start = time.time()
+    t0 = time.time()
 
     try:
         files = request.files.getlist("images")
         if not files:
-            return jsonify({
-                "valid_cattle": False,
-                "message": "No images received."
-            }), 400
+            return jsonify({"valid_cattle": False, "message": "No images received."}), 400
 
-        # Load images
-        images = []
-        for f in files[:5]:
-            try:
-                raw = f.read()
-                img = Image.open(io.BytesIO(raw)).convert("RGB")
-                img = enhance_image(img)
-                images.append(img)
-                del raw
-            except Exception as e:
-                print(f"⚠️ Skipped bad image: {e}")
-                continue
+        # Load all images in parallel
+        futures = [executor.submit(load_image, f) for f in files[:5]]
+        images  = [fut.result() for fut in futures if fut.result() is not None]
+
+        t_load = round(time.time() - t0, 3)
 
         if not images:
-            return jsonify({
-                "valid_cattle": False,
-                "message": "Could not read images. Please try again."
-            }), 400
+            return jsonify({"valid_cattle": False, "message": "Could not read images. Please try again."})
 
         # ---- BATCH INFERENCE ----
-        predictions = []
-        confidences = []
-        prob_accumulator = {}
-
         with torch.no_grad():
-            results = model.predict(
-                images,
-                imgsz=640,
-                verbose=False,
-                half=False
-            )
+            results = model.predict(images, imgsz=640, verbose=False, half=False)
+
+        t_infer = round(time.time() - t0, 3)
+
+        predictions, confidences, prob_acc = [], [], {}
 
         for result in results:
             if result.probs is None:
                 continue
+            cls  = int(result.probs.top1)
+            conf = float(result.probs.top1conf)
+            name = model.names[cls]
+            predictions.append(name)
+            confidences.append(conf)
+            print(f"  → {name}: {round(conf*100,1)}%")
 
-            top1_cls  = int(result.probs.top1)
-            top1_conf = float(result.probs.top1conf)
-            top1_name = model.names[top1_cls]
-
-            predictions.append(top1_name)
-            confidences.append(top1_conf)
-
-            # Print every result for debugging
-            print(f"  → {top1_name}: {round(top1_conf*100,1)}%")
-
-            # Accumulate top-5 probs
-            for idx, conf in zip(result.probs.top5, result.probs.top5conf):
-                name = model.names[int(idx)]
-                prob_accumulator[name] = prob_accumulator.get(name, 0.0) + float(conf)
+            for idx, c in zip(result.probs.top5, result.probs.top5conf):
+                n = model.names[int(idx)]
+                prob_acc[n] = prob_acc.get(n, 0.0) + float(c)
 
         if not predictions:
-            return jsonify({
-                "valid_cattle": False,
-                "message": "Model returned no results. Please try a clearer image."
-            })
+            return jsonify({"valid_cattle": False, "message": "Model returned no results. Try a clearer image."})
 
-        # ---- WEIGHTED ENSEMBLE ----
-        vote_counts = Counter(predictions)
-        scores = {
-            name: prob_accumulator.get(name, 0.0) * (vote_counts.get(name, 0) + 1)
-            for name in set(predictions)
-        }
-        best_breed = max(scores, key=scores.get)
+        # Weighted ensemble: probability sum × vote count
+        votes = Counter(predictions)
+        scores = {n: prob_acc.get(n, 0.0) * (votes.get(n, 0) + 1) for n in set(predictions)}
+        best = max(scores, key=scores.get)
 
-        breed_confs = [c for p, c in zip(predictions, confidences) if p == best_breed]
+        breed_confs = [c for p, c in zip(predictions, confidences) if p == best]
         avg_conf = sum(breed_confs) / len(breed_confs) if breed_confs else 0
 
-        print(f"🏆 Winner: {best_breed} | avg_conf={round(avg_conf*100,1)}% | votes={vote_counts.get(best_breed,0)}/{len(images)}")
+        print(f"🏆 {best} | conf={round(avg_conf*100,1)}% | votes={votes.get(best)}/{len(images)} | load={t_load}s | infer={t_infer}s")
 
-        # ---- THRESHOLD: VERY LOW for 53-class model ----
-        # With 53 classes, even correct predictions can be 20-40%
-        # Only reject if truly garbage (< 8%)
+        # Only reject complete garbage (< 8% for 53-class model)
         if avg_conf < 0.08:
             return jsonify({
                 "valid_cattle": False,
-                "message": f"Image unclear. Best guess was {best_breed} at only {round(avg_conf*100,1)}% confidence. Please upload a clearer, closer photo of the cattle."
+                "message": f"Could not identify breed (confidence too low: {round(avg_conf*100,1)}%). Please upload a clearer, closer photo."
             })
 
-        final_confidence = round(avg_conf * 100, 1)
+        final_conf = round(avg_conf * 100, 1)
+        trust = "HIGH" if avg_conf >= 0.60 else "MEDIUM" if avg_conf >= 0.30 else "LOW"
 
-        # Honest trust levels for 53-class model
-        if avg_conf >= 0.60:
-            trust = "HIGH"
-        elif avg_conf >= 0.30:
-            trust = "MEDIUM"
-        else:
-            trust = "LOW"
+        # Breed info from RAM cache — instant
+        breed_info = breed_cache.get(best, {})
 
-        # Get breed info from cache (instant)
-        breed_info = breed_cache.get(best_breed, {})
-
-        elapsed = round(time.time() - t_start, 2)
-        print(f"✅ Done: {best_breed} | {final_confidence}% | {trust} | {len(images)} imgs | {elapsed}s")
+        elapsed = round(time.time() - t0, 2)
 
         return jsonify({
             "valid_cattle": True,
-            "breed": best_breed,
-            "confidence": final_confidence,
+            "breed": best,
+            "confidence": final_conf,
             "trust": trust,
             "images_used": len(images),
             "inference_time": elapsed,
@@ -219,8 +207,6 @@ def predict():
 
     except Exception as e:
         gc.collect()
-        print(f"❌ Predict error: {e}")
-        import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
@@ -232,27 +218,18 @@ def predict():
 def get_all_breeds():
     return jsonify({
         "total": len(breed_cache),
-        "breeds": [
-            {"name": v.get("name"), "origin": v.get("origin"), "purpose": v.get("purpose")}
-            for v in breed_cache.values()
-        ]
+        "breeds": [{"name": v.get("name"), "origin": v.get("origin"), "purpose": v.get("purpose")} for v in breed_cache.values()]
     })
 
 @app.route("/breed/<breed_name>")
 def get_breed_details(breed_name):
-    breed = breed_cache.get(breed_name)
-    if breed:
-        return jsonify(breed)
-    for key, val in breed_cache.items():
-        if key.lower() == breed_name.lower():
-            return jsonify(val)
+    b = breed_cache.get(breed_name)
+    if b: return jsonify(b)
+    for k, v in breed_cache.items():
+        if k.lower() == breed_name.lower(): return jsonify(v)
     return jsonify({"error": f"Breed '{breed_name}' not found"}), 404
 
 
-# ============================================================
-# START
-# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    print(f"🚀 PashuMitra starting on port {port}")
     app.run(host="0.0.0.0", port=port)
